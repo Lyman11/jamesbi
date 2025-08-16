@@ -25,7 +25,7 @@ with st.sidebar:
     st.header("设置")
     default_key = os.getenv("GOOGLE_API_KEY", "")
     api_key = st.text_input("Google Gemini API Key", value=default_key, type="password", help="优先使用环境变量 GOOGLE_API_KEY")
-    model_name = st.selectbox("选择模型", ["gemini-1.5-flash", "gemini-1.5-pro"], index=0, help="Flash 更快更省，Pro 更强但更慢")
+    model_name = st.selectbox("选择模型", ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.5-flash"], index=0, help="Flash 更快更省，Pro 更强但更慢，2.5 Flash 是最新模型")
     max_items = st.slider("每条评价最多提炼条数（优/缺点各）", 1, 8, 5, 1)
     st.markdown("---")
     st.info("提示：请确保网络可访问 Gemini 服务。如需安全保管密钥，建议使用环境变量 GOOGLE_API_KEY。")

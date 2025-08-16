@@ -35,6 +35,8 @@ pip install -r requirements.txt
 - 或在应用左侧输入框直接粘贴
 
 3) 启动应用
+   
+**方式一：直接运行（前台）**
 ```bash
 streamlit run app.py
 ```
@@ -42,6 +44,32 @@ streamlit run app.py
 ```bash
 streamlit run app.py --server.port 8502
 ```
+
+**方式二：使用PM2后台运行（推荐生产环境）**
+
+本项目已配置PM2支持，可在后台持续运行：
+
+```bash
+# 确保脚本有执行权限
+chmod +x start_app.sh
+
+# 使用PM2启动应用
+pm2 start ecosystem.config.js
+
+# 查看应用状态
+pm2 status
+
+# 查看应用日志
+pm2 logs amazon-review-analyzer
+
+# 停止应用
+pm2 stop amazon-review-analyzer
+
+# 重启应用
+pm2 restart amazon-review-analyzer
+```
+
+注意：PM2方式运行时会使用`.james`虚拟环境，确保已正确创建该环境。
 
 ## 文件准备与格式
 - 支持：CSV、XLSX、XLS
@@ -68,6 +96,7 @@ review
 - 模型选择：
   - gemini-1.5-flash：速度更快、成本更低
   - gemini-1.5-pro：能力更强但速度较慢
+  - gemini-2.5-flash：最新模型，性能更优
 - 每条最多提炼条数：限制每条评价的“优点/缺点”数量，避免冗余
 
 ## 隐私与成本
