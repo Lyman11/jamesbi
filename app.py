@@ -4,9 +4,38 @@ from typing import List, Tuple
 
 import pandas as pd
 import streamlit as st
+import time
+import random
 
 # Google Gemini
 import google.generativeai as genai
+
+# 抑制 Tornado 在客户端断开时的 WebSocketClosedError 噪音，并降低 Tornado 日志级别
+try:
+    import asyncio
+    import logging
+    from tornado.websocket import WebSocketClosedError
+    from tornado.iostream import StreamClosedError
+
+    def _ignore_ws_closed(loop, context):
+        err = context.get("exception")
+        if isinstance(err, (WebSocketClosedError, StreamClosedError)):
+            # 忽略客户端断开连接导致的噪音异常
+            return
+        loop.default_exception_handler(context)
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.set_exception_handler(_ignore_ws_closed)
+    except Exception:
+        # 某些运行环境下事件循环不可设置，安全忽略
+        pass
+
+    for _logger_name in ("tornado.general", "tornado.access", "tornado.application", "tornado.websocket"):
+        logging.getLogger(_logger_name).setLevel(logging.ERROR)
+except Exception:
+    # 安全兜底，避免影响应用主流程
+    pass
 
 
 # -----------------------
@@ -27,6 +56,8 @@ with st.sidebar:
     api_key = st.text_input("Google Gemini API Key", value=default_key, type="password", help="优先使用环境变量 GOOGLE_API_KEY")
     model_name = st.selectbox("选择模型", ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.5-flash"], index=0, help="Flash 更快更省，Pro 更强但更慢，2.5 Flash 是最新模型")
     max_items = st.slider("每条评价最多提炼条数（优/缺点各）", 1, 8, 5, 1)
+    rpm = st.slider("每分钟最大请求数（RPM）", 5, 120, 30, 5)
+    st.session_state["_rpm"] = rpm
     st.markdown("---")
     st.info("提示：请确保网络可访问 Gemini 服务。如需安全保管密钥，建议使用环境变量 GOOGLE_API_KEY。")
 
@@ -113,37 +144,60 @@ def build_extract_prompt(review: str, max_items_each: int) -> str:
 """.strip()
 
 
-def analyze_one_review(review: str, model_name: str, max_items_each: int) -> Tuple[List[str], List[str]]:
-    # 采用 JSON 响应，降低解析失败概率
+def analyze_one_review(review: str, model_name: str, max_items_each: int, rpm: int) -> Tuple[List[str], List[str]]:
+    # 带速率限制与指数退避重试，降低429概率
     model = genai.GenerativeModel(
         model_name=model_name,
         generation_config={"response_mime_type": "application/json"},
     )
     prompt = build_extract_prompt(review, max_items_each)
-    try:
-        resp = model.generate_content(prompt)
-        text = (resp.text or "").strip()
-        # 去掉可能的代码围栏
-        if text.startswith("```"):
-            text = text.strip("`")
-            # 处理例如 ```json ... ```
-            parts = text.split("\n", 1)
-            if len(parts) == 2:
-                text = parts[1]
-            text = text.split("```")[0].strip()
+    retries = 4
+    base_delay = 2.0
+    for attempt in range(retries + 1):
+        try:
+            # 速率限制：控制每分钟请求数
+            min_interval = 60.0 / max(1, rpm)
+            last_ts = st.session_state.get("_last_call_ts", 0.0)
+            elapsed = time.time() - last_ts
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
 
-        data = json.loads(text)
-        pros = data.get("pros", [])
-        cons = data.get("cons", [])
-        # 规范化
-        pros = [str(x).strip() for x in pros if str(x).strip()]
-        cons = [str(x).strip() for x in cons if str(x).strip()]
-        pros = unique_preserve(pros, max_items_each)
-        cons = unique_preserve(cons, max_items_each)
-        return pros, cons
-    except Exception as e:
-        # 返回空，避免中断整体流程
-        return [], [f"解析失败或调用错误：{e}"]
+            resp = model.generate_content(prompt)
+            st.session_state["_last_call_ts"] = time.time()
+
+            text = (resp.text or "").strip()
+            # 去掉可能的代码围栏
+            if text.startswith("```"):
+                text = text.strip("`")
+                # 处理例如 ```json ... ```
+                parts = text.split("\n", 1)
+                if len(parts) == 2:
+                    text = parts[1]
+                text = text.split("```")[0].strip()
+
+            data = json.loads(text)
+            pros = data.get("pros", [])
+            cons = data.get("cons", [])
+            # 规范化
+            pros = [str(x).strip() for x in pros if str(x).strip()]
+            cons = [str(x).strip() for x in cons if str(x).strip()]
+            pros = unique_preserve(pros, max_items_each)
+            cons = unique_preserve(cons, max_items_each)
+            return pros, cons
+        except Exception as e:
+            msg = str(e).lower()
+            # 针对配额/速率限制做指数退避
+            if ("429" in msg) or ("quota" in msg) or ("rate" in msg) or ("exceed" in msg):
+                delay = base_delay * (1.6 ** attempt) + random.uniform(0, 0.5)
+                # 简单等待后重试
+                time.sleep(delay)
+                continue
+            # 其他错误也做有限重试
+            if attempt < retries:
+                time.sleep(1.0 + 0.25 * attempt)
+                continue
+            # 最终失败
+            return [], [f"解析失败或调用错误：{e}"]
 
 
 def build_summary_prompt(all_pros: List[str], all_cons: List[str]) -> str:
@@ -166,17 +220,41 @@ def build_summary_prompt(all_pros: List[str], all_cons: List[str]) -> str:
 """.strip()
 
 
-def stream_summary(all_pros: List[str], all_cons: List[str], model_name: str):
-    # 流式生成不指定 JSON
+def stream_summary(all_pros: List[str], all_cons: List[str], model_name: str, rpm: int):
+    # 流式生成，带速率限制与有限重试
     model = genai.GenerativeModel(model_name=model_name)
     prompt = build_summary_prompt(all_pros, all_cons)
-    response = model.generate_content(prompt, stream=True)
-    for chunk in response:
+    retries = 2
+    base_delay = 2.0
+    for attempt in range(retries + 1):
         try:
-            if hasattr(chunk, "text") and chunk.text:
-                yield chunk.text
-        except Exception:
-            continue
+            # 速率限制：控制每分钟请求数
+            min_interval = 60.0 / max(1, rpm)
+            last_ts = st.session_state.get("_last_call_ts", 0.0)
+            elapsed = time.time() - last_ts
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+
+            response = model.generate_content(prompt, stream=True)
+            st.session_state["_last_call_ts"] = time.time()
+            for chunk in response:
+                try:
+                    if hasattr(chunk, "text") and chunk.text:
+                        yield chunk.text
+                except Exception:
+                    continue
+            return
+        except Exception as e:
+            msg = str(e).lower()
+            if ("429" in msg) or ("quota" in msg) or ("rate" in msg) or ("exceed" in msg):
+                delay = base_delay * (1.6 ** attempt) + random.uniform(0, 0.5)
+                yield f"\n\n（等待配额恢复 {delay:.1f}s 后重试...）"
+                time.sleep(delay)
+                continue
+            else:
+                yield f"\n\n（生成失败：{e}）"
+                return
+    yield "\n\n（多次重试后仍受限，请稍后再试。）"
 
 
 # -----------------------
@@ -233,7 +311,7 @@ if start_clicked:
                 table_container = results_placeholder.container()
 
                 for i, review in enumerate(reviews, start=1):
-                    pros, cons = analyze_one_review(review, model_name, max_items)
+                    pros, cons = analyze_one_review(review, model_name, max_items, st.session_state.get("_rpm", 30))
                     st.session_state.analysis_results.append({
                         "index": i,
                         "review": review,
@@ -282,7 +360,7 @@ if summary_clicked:
             st.subheader("🧾 汇总（流式输出）")
             with st.container(border=True):
                 # 流式输出
-                st.write_stream(stream_summary(all_pros, all_cons, model_name))
+                st.write_stream(stream_summary(all_pros, all_cons, model_name, st.session_state.get("_rpm", 30)))
             st.session_state.summary_done = True
 
 
